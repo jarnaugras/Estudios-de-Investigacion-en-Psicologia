@@ -1,0 +1,337 @@
+library(shiny)
+library(shinydashboard)
+library(WRS2)
+library(MKinfer)
+library(mice)
+library(miceadds)
+library(boot)
+library(DT)
+library(ggplot2)
+library(parallel)  # Para paralelización
+library(reshape2)  # Para la función melt
+
+# Interfaz de usuario
+ui <- dashboardPage(
+  dashboardHeader(
+    title = "Simulación de Errores Tipo I",
+    titleWidth = 300
+  ),
+  
+  dashboardSidebar(
+    width = 300,
+    sidebarMenu(
+      menuItem("Simulación", tabName = "simulacion", icon = icon("calculator")),
+      menuItem("Resultados", tabName = "resultados", icon = icon("chart-bar")),
+      menuItem("Gráficos", tabName = "graficos", icon = icon("chart-line"))
+    ),
+    
+    hr(),
+    
+    h4("Parámetros de Simulación", style = "padding-left: 15px;"),
+    numericInput("n_sim", "Número de simulaciones:", 
+                value = 100, min = 50, max = 1000, step = 50),
+    numericInput("n_boot", "Número de bootstrap:", 
+                value = 200, min = 100, max = 500, step = 50),
+    numericInput("n1", "Tamaño grupo 1:", 
+                value = 3, min = 2, max = 100, step = 1),
+    numericInput("n2", "Tamaño grupo 2:", 
+                value = 3, min = 2, max = 100, step = 1),
+    
+    hr(),
+    
+    h4("Parámetros de Distribución", style = "padding-left: 15px;"),
+    numericInput("mean1", "Media grupo 1:", value = 0),
+    numericInput("mean2", "Media grupo 2:", value = 0),
+    numericInput("sd1", "Desviación estándar grupo 1:", value = 1),
+    numericInput("sd2", "Desviación estándar grupo 2:", value = 1),
+    numericInput("skew1", "Asimetría grupo 1:", value = 0.4),
+    numericInput("skew2", "Asimetría grupo 2:", value = 0.8),
+    numericInput("kurt1", "Curtosis grupo 1:", value = 1),
+    numericInput("kurt2", "Curtosis grupo 2:", value = 1.5),
+    
+    hr(),
+    
+    h4("Nivel de Significancia", style = "padding-left: 15px;"),
+    numericInput("alpha", "α:", 
+                value = 0.05, min = 0.01, max = 0.10, step = 0.01),
+    
+    hr(),
+    
+    actionButton("simular", "Iniciar Simulación",
+                 icon = icon("play"),
+                 class = "btn-primary",
+                 style = "width: 100%; margin-bottom: 10px;"),
+    
+    downloadButton("downloadReport", "Descargar Reporte",
+                  class = "btn-success",
+                  style = "width: 100%;")
+  ),
+  
+  dashboardBody(
+    tabItems(
+      tabItem(tabName = "simulacion",
+              fluidRow(
+                box(title = "Progreso de la Simulación", width = 12,
+                    textOutput("simulacion_status"))
+              ),
+              fluidRow(
+                box(title = "Parámetros Actuales", width = 12,
+                    tableOutput("parametros_tabla"))
+              )
+      ),
+      
+      tabItem(tabName = "resultados",
+              fluidRow(
+                box(title = "Errores Tipo I Estimados", width = 12,
+                    tableOutput("resultados_tabla"))
+              ),
+              fluidRow(
+                box(title = "Distribución de p-valores", width = 6,
+                    plotOutput("pvalues_hist")),
+                box(title = "Comparación de Métodos", width = 6,
+                    plotOutput("metodos_comparacion"))
+              )
+      ),
+      
+      tabItem(tabName = "graficos",
+              fluidRow(
+                box(title = "Distribución de Datos", width = 6,
+                    plotOutput("distribucion_datos")),
+                box(title = "QQ-Plot", width = 6,
+                    plotOutput("qq_plot"))
+              ),
+              fluidRow(
+                box(title = "Bootstrap Distributions", width = 12,
+                    plotOutput("bootstrap_dist"))
+              )
+      )
+    )
+  )
+)
+
+# Servidor
+server <- function(input, output, session) {
+  
+  # Función optimizada para generar datos
+  generate_fleishman <- function(n, mean, sd, skew, kurt) { 
+    rnorm_data <- rnorm(n)
+    z <- (rnorm_data - mean) / sd
+    x <- mean + sd * (z + 0.5 * (z^2 - 1) * skew + (z^3 - 3*z) * (kurt / 24))
+    return(x)
+  }
+  
+  # Función para realizar una simulación individual
+  run_simulation <- function(i, params) {
+    # Generar datos
+    group1 <- generate_fleishman(params$n1, params$mean1, params$sd1, params$skew1, params$kurt1)
+    group2 <- generate_fleishman(params$n2, params$mean2, params$sd2, params$skew2, params$kurt2)
+    
+    # Preparar datos para Yuen
+    data_long <- data.frame(
+      value = c(group1, group2),
+      group = rep(c("group1", "group2"), times = c(params$n1, params$n2))
+    )
+    
+    # Realizar pruebas
+    t_test <- t.test(group1, group2, var.equal = TRUE)
+    welch_t_test <- t.test(group1, group2, var.equal = FALSE)
+    yuen_test <- yuen(value ~ group, data = data_long, tr = 0.2)
+    mann_whitney <- wilcox.test(group1, group2)
+    
+    # Bootstrap para Welch
+    data <- data.frame(group1 = group1, group2 = group2)
+    boot_res_welch <- boot(data, statistic = function(data, indices) {
+      d <- data[indices, ]
+      t.test(d$group1, d$group2)$statistic
+    }, R = params$n_boot)
+    
+    # Bootstrap para Yuen
+    boot_res_yuen <- boot(data_long, statistic = function(data, indices) {
+      d <- data[indices, ]
+      yuen_result <- yuen(value ~ group, data = d, tr = 0.2)
+      return(yuen_result$teststat)
+    }, R = params$n_boot)
+    
+    return(c(
+      t_test$p.value,
+      welch_t_test$p.value,
+      yuen_test$p.value,
+      mann_whitney$p.value,
+      2 * min(mean(boot_res_welch$t >= 0), mean(boot_res_welch$t <= 0)),
+      2 * min(mean(boot_res_yuen$t >= 0), mean(boot_res_yuen$t <= 0))
+    ))
+  }
+  
+  # Simulación reactiva
+  simulacion <- eventReactive(input$simular, {
+    withProgress(message = 'Realizando simulación', value = 0, {
+      # Preparar parámetros para el cluster
+      sim_params <- list(
+        n1 = input$n1,
+        n2 = input$n2,
+        mean1 = input$mean1,
+        mean2 = input$mean2,
+        sd1 = input$sd1,
+        sd2 = input$sd2,
+        skew1 = input$skew1,
+        skew2 = input$skew2,
+        kurt1 = input$kurt1,
+        kurt2 = input$kurt2,
+        n_boot = input$n_boot
+      )
+      
+      # Configurar paralelización
+      n_cores <- detectCores() - 1
+      cl <- makeCluster(n_cores)
+      
+      # Exportar funciones y parámetros al cluster
+      clusterExport(cl, c("run_simulation", "generate_fleishman", "sim_params"), envir = environment())
+      clusterEvalQ(cl, {
+        library(WRS2)
+        library(boot)
+        library(shiny)
+      })
+      
+      # Dividir las simulaciones en lotes para mostrar progreso
+      n_sim <- input$n_sim
+      batch_size <- 10
+      n_batches <- ceiling(n_sim / batch_size)
+      
+      results <- list()
+      for (batch in 1:n_batches) {
+        start_idx <- (batch - 1) * batch_size + 1
+        end_idx <- min(batch * batch_size, n_sim)
+        current_batch_size <- end_idx - start_idx + 1
+        
+        # Realizar simulaciones en paralelo para el lote actual
+        batch_results <- parLapply(cl, start_idx:end_idx, function(i) {
+          tryCatch({
+            run_simulation(i, sim_params)
+          }, error = function(e) {
+            print(paste("Error en simulación", i, ":", e$message))
+            return(rep(NA, 6))  # Retornar valores NA en caso de error
+          })
+        })
+        
+        # Combinar resultados
+        results <- c(results, batch_results)
+        
+        # Actualizar progreso
+        incProgress(1/n_batches, detail = paste("Lote", batch, "de", n_batches))
+      }
+      
+      # Cerrar el cluster correctamente
+      on.exit(stopCluster(cl))
+      
+      # Procesar resultados
+      results_matrix <- do.call(rbind, results)
+      colnames(results_matrix) <- c("t_test", "welch", "yuen", "mann_whitney", "bt_welch", "bt_yuen")
+      
+      # Calcular errores tipo I
+      error_tipo_I <- colMeans(results_matrix < input$alpha, na.rm = TRUE)
+      
+      return(list(
+        errors = error_tipo_I,
+        p_values = as.data.frame(results_matrix)
+      ))
+    })
+  })
+  
+  # Salidas
+  output$parametros_tabla <- renderTable({
+    data.frame(
+      Parámetro = c("Número de simulaciones", "Número de bootstrap", "Tamaño grupo 1", "Tamaño grupo 2",
+                    "Media grupo 1", "Media grupo 2", "Desviación estándar grupo 1",
+                    "Desviación estándar grupo 2", "Asimetría grupo 1",
+                    "Asimetría grupo 2", "Curtosis grupo 1", "Curtosis grupo 2",
+                    "Nivel de significancia"),
+      Valor = c(input$n_sim, input$n_boot, input$n1, input$n2, input$mean1, input$mean2,
+                input$sd1, input$sd2, input$skew1, input$skew2, input$kurt1,
+                input$kurt2, input$alpha)
+    )
+  })
+  
+  output$resultados_tabla <- renderTable({
+    req(simulacion())
+    data.frame(
+      Método = c("t-Test", "Welch", "Yuen", "Mann-Whitney", 
+                 "Bootstrap-t Welch", "Bootstrap-t Yuen"),
+      `Error Tipo I` = unlist(simulacion()$errors)
+    )
+  })
+  
+  output$pvalues_hist <- renderPlot({
+    req(simulacion())
+    p_values <- simulacion()$p_values$t_test
+    ggplot(data.frame(p_values), aes(x = p_values)) +
+      geom_histogram(bins = 30, fill = "blue", alpha = 0.5) +
+      geom_vline(xintercept = input$alpha, color = "red", linetype = "dashed") +
+      theme_minimal() +
+      labs(x = "p-valor", y = "Frecuencia")
+  })
+  
+  output$metodos_comparacion <- renderPlot({
+    req(simulacion())
+    # Convertir los datos a formato largo y eliminar NA
+    df <- melt(simulacion()$p_values, id.vars = NULL)
+    df <- na.omit(df)
+    
+    ggplot(df, aes(x = variable, y = value)) +
+      geom_boxplot() +
+      theme_minimal() +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+      labs(x = "Método", y = "p-valor")
+  })
+  
+  output$distribucion_datos <- renderPlot({
+    req(simulacion())
+    group1 <- generate_fleishman(input$n1, input$mean1, input$sd1, input$skew1, input$kurt1)
+    group2 <- generate_fleishman(input$n2, input$mean2, input$sd2, input$skew2, input$kurt2)
+    df <- data.frame(
+      value = c(group1, group2),
+      group = rep(c("Grupo 1", "Grupo 2"), times = c(input$n1, input$n2))
+    )
+    ggplot(df, aes(x = value, fill = group)) +
+      geom_density(alpha = 0.5) +
+      theme_minimal()
+  })
+  
+  output$qq_plot <- renderPlot({
+    req(simulacion())
+    group1 <- generate_fleishman(input$n1, input$mean1, input$sd1, input$skew1, input$kurt1)
+    qqnorm(group1)
+    qqline(group1)
+  })
+  
+  output$bootstrap_dist <- renderPlot({
+    req(simulacion())
+    group1 <- generate_fleishman(input$n1, input$mean1, input$sd1, input$skew1, input$kurt1)
+    group2 <- generate_fleishman(input$n2, input$mean2, input$sd2, input$skew2, input$kurt2)
+    data <- data.frame(group1 = group1, group2 = group2)
+    boot_res <- boot(data, statistic = function(data, indices) {
+      d <- data[indices, ]
+      t.test(d$group1, d$group2)$statistic
+    }, R = input$n_boot)
+    ggplot(data.frame(t = boot_res$t), aes(x = t)) +
+      geom_density(fill = "blue", alpha = 0.5) +
+      theme_minimal()
+  })
+  
+  output$simulacion_status <- renderText({
+    req(simulacion())
+    "Simulación completada"
+  })
+  
+  # Descargar reporte
+  output$downloadReport <- downloadHandler(
+    filename = function() {
+      paste("reporte_simulacion_", Sys.Date(), ".pdf", sep = "")
+    },
+    content = function(file) {
+      # Aquí iría el código para generar el reporte PDF
+    }
+  )
+}
+
+# Ejecutar la aplicación
+shinyApp(ui = ui, server = server) 
